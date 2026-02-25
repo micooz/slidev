@@ -84,6 +84,15 @@ function sleep(ms: number) {
   return new Promise<void>(resolve => setTimeout(resolve, ms))
 }
 
+function parseVideoMotionScale(value?: string) {
+  if (!value)
+    return 1
+  const scale = Number.parseFloat(value)
+  if (!Number.isFinite(scale) || scale <= 0)
+    return 1
+  return scale
+}
+
 function addToTree(tree: TocItem[], info: SlideInfo, slideIndexes: Record<number, number>, level = 1) {
   const titleLevel = info.level
   if (titleLevel && titleLevel > level && tree.length > 0 && tree[tree.length - 1].titleLevel < titleLevel) {
@@ -610,27 +619,6 @@ export async function exportSlides({
     await fs.writeFile(output, buffer)
   }
 
-  async function waitForStepChanged(previousStamp: string, timeout = 1200) {
-    return await page.waitForFunction((prev) => {
-      const bridge = window.__slidev_export__
-      if (typeof bridge?.getStepStamp === 'function')
-        return bridge.getStepStamp() !== prev
-
-      const nav = window.__slidev__?.nav
-      const currentSlideNo = nav?.currentSlideNo
-      const clicks = nav?.clicks
-      const slideNo = (typeof currentSlideNo === 'object' && currentSlideNo && 'value' in currentSlideNo)
-        ? Number(currentSlideNo.value ?? 0)
-        : Number(currentSlideNo ?? 0)
-      const clickNo = (typeof clicks === 'object' && clicks && 'value' in clicks)
-        ? Number(clicks.value ?? 0)
-        : Number(clicks ?? 0)
-      return `${slideNo}-${clickNo}` !== prev
-    }, previousStamp, { timeout })
-      .then(() => true)
-      .catch(() => false)
-  }
-
   function getStepKey(step: Pick<Mp4StepInfo, 'no' | 'clicks'>) {
     return `${step.no}-${step.clicks}`
   }
@@ -681,8 +669,8 @@ export async function exportSlides({
     })
   }
 
-  async function waitForStepSettled(timeout = 10000) {
-    const settleBudget = await page.evaluate(() => {
+  async function getTransitionSettleBudget() {
+    return await page.evaluate(() => {
       const raw = getComputedStyle(document.documentElement)
         .getPropertyValue('--slidev-transition-duration')
         .trim()
@@ -700,6 +688,10 @@ export async function exportSlides({
       // Keep this bounded to avoid long waits caused by custom/infinite animations.
       return Math.max(120, Math.min(3000, parseMs(raw) + 300))
     })
+  }
+
+  async function waitForStepSettled(timeout = 10000) {
+    const settleBudget = await getTransitionSettleBudget()
 
     await sleep(settleBudget)
 
@@ -745,6 +737,12 @@ export async function exportSlides({
       output = `${output}.mp4`
 
     const debugMp4 = process.env.SLIDEV_EXPORT_DEBUG_MP4 === 'true'
+    // Capture-side motion dilation. >1 means slower visual motion while recording,
+    // so high-resolution exports can collect more unique frames per transition.
+    const motionScale = parseVideoMotionScale(process.env.SLIDEV_EXPORT_MOTION_SCALE)
+    // Encoding-side timeline compression to restore the intended playback pace
+    // after capture-side motion dilation.
+    const playbackSpeedup = motionScale > 1 ? motionScale : 1
 
     const startSlideNo = pages[0] ?? 1
     const endSlideNo = pages[pages.length - 1] ?? startSlideNo
@@ -755,7 +753,66 @@ export async function exportSlides({
     await waitForFfmpeg()
     await goPlay(startSlideNo, 0)
 
-    const ffmpeg = spawn('ffmpeg', [
+    if (motionScale > 1) {
+      const applied = await page.evaluate((scale) => {
+        const root = document.documentElement
+        const raw = getComputedStyle(root)
+          .getPropertyValue('--slidev-transition-duration')
+          .trim()
+
+        const parseMs = (value: string) => {
+          if (!value)
+            return 0
+          if (value.endsWith('ms'))
+            return Number.parseFloat(value.slice(0, -2)) || 0
+          if (value.endsWith('s'))
+            return (Number.parseFloat(value.slice(0, -1)) || 0) * 1000
+          return Number.parseFloat(value) || 0
+        }
+
+        const transitionMs = parseMs(raw)
+        if (transitionMs > 0)
+          root.style.setProperty('--slidev-transition-duration', `${transitionMs * scale}ms`)
+
+        const applyAnimationRate = () => {
+          document.getAnimations().forEach((animation) => {
+            if (!(animation as any).__slidev_export_original_rate)
+              (animation as any).__slidev_export_original_rate = animation.playbackRate || 1
+            const baseRate = (animation as any).__slidev_export_original_rate || 1
+            animation.playbackRate = baseRate / scale
+          })
+        }
+
+        applyAnimationRate()
+        // Some animations start lazily during interaction; keep normalizing their
+        // playbackRate while exporting.
+        const timer = window.setInterval(applyAnimationRate, 250)
+
+        const win = window as any
+        const previousCleanup = win.__slidev_export_motion_cleanup__
+        if (typeof previousCleanup === 'function') {
+          previousCleanup()
+        }
+
+        win.__slidev_export_motion_cleanup__ = () => {
+          clearInterval(timer)
+        }
+
+        return {
+          transitionMs,
+          appliedTransitionMs: transitionMs > 0 ? transitionMs * scale : 0,
+        }
+      }, motionScale)
+
+      if (debugMp4) {
+        process.stderr.write(`[slidev] mp4 motion scale x${motionScale}\n`)
+        process.stderr.write(`[slidev] mp4 timeline speedup x${playbackSpeedup}\n`)
+        if (applied.transitionMs > 0)
+          process.stderr.write(`[slidev] mp4 transition duration ${Math.round(applied.transitionMs)}ms -> ${Math.round(applied.appliedTransitionMs)}ms\n`)
+      }
+    }
+
+    const ffmpegArgs = [
       '-y',
       '-f',
       'image2pipe',
@@ -768,12 +825,30 @@ export async function exportSlides({
       '-an',
       '-c:v',
       'libx264',
+      // Reduce encoder-side backpressure when exporting high-resolution videos.
+      '-preset',
+      'veryfast',
+    ]
+
+    if (playbackSpeedup > 1) {
+      // Render with slower motion, then speed up the timeline back to target pace.
+      ffmpegArgs.push(
+        '-vf',
+        `setpts=PTS/${playbackSpeedup}`,
+        '-r',
+        `${videoFps}`,
+      )
+    }
+
+    ffmpegArgs.push(
       '-pix_fmt',
       'yuv420p',
       '-movflags',
       '+faststart',
       output,
-    ], {
+    )
+
+    const ffmpeg = spawn('ffmpeg', ffmpegArgs, {
       stdio: ['pipe', 'ignore', 'pipe'],
     })
 
@@ -829,7 +904,9 @@ export async function exportSlides({
     }
 
     const startedAt = Date.now()
+    const frameInterval = 1000 / videoFps
     let writtenFrames = 0
+    let nextFrameTime = 0
 
     async function catchUpFrames(buffer: Buffer) {
       const now = Date.now()
@@ -841,20 +918,49 @@ export async function exportSlides({
       }
     }
 
-    let shouldCapture = true
-    let playbackError: unknown
+    async function captureAndWriteFrame() {
+      const frame = await captureFrame()
+      await writeFrame(frame)
+      writtenFrames += 1
+      await catchUpFrames(frame)
 
-    const playback = (async () => {
+      const elapsedMs = Date.now() - startedAt
+      nextFrameTime = (writtenFrames + 1) * frameInterval
+      const sleepMs = nextFrameTime - elapsedMs
+      if (sleepMs > 0)
+        await sleep(sleepMs)
+
+      return frame
+    }
+
+    async function captureForDuration(durationMs: number) {
+      if (durationMs <= 0)
+        return
+
+      const deadline = Date.now() + durationMs
+      while (Date.now() < deadline)
+        await captureAndWriteFrame()
+    }
+
+    let captureError: unknown
+    try {
+      const initialFrame = await captureFrame()
+      await writeFrame(initialFrame)
+      writtenFrames += 1
+      await catchUpFrames(initialFrame)
+
       while (true) {
+        // Keep the interval anchored after each step animation settles.
         await waitForStepSettled()
-        await sleep(videoInterval)
+        // We are capturing slowed motion, then compressing time in ffmpeg via setpts.
+        // Scale capture duration so the final encoded video keeps the same interval.
+        await captureForDuration(videoInterval * playbackSpeedup)
 
         const step = await getStepInfo()
         if (debugMp4)
           process.stderr.write(`[slidev] mp4 step ${step.no}-${step.clicks}/${step.clicksTotal} hasNext=${step.hasNext}\n`)
         const canAdvanceInRange = step.no < endSlideNo
           || (step.no === endSlideNo && step.clicks < step.clicksTotal)
-
         if (!step.hasNext || !canAdvanceInRange)
           break
 
@@ -863,41 +969,26 @@ export async function exportSlides({
         if (!advanced)
           throw new Error('[slidev] Failed to trigger next step in browser context.')
 
-        const changed = await waitForStepChanged(previousStamp, Math.min(10000, timeout))
+        let changed = false
+        const transitionTimeoutMs = Math.min(10000, Math.max(2000, timeout))
+        const transitionDeadline = Date.now() + transitionTimeoutMs
+
+        while (Date.now() < transitionDeadline) {
+          await captureAndWriteFrame()
+          const current = await getStepInfo()
+          if (getStepKey(current) !== previousStamp) {
+            changed = true
+            break
+          }
+        }
+
         if (!changed)
           throw new Error(`[slidev] Failed to advance from step ${previousStamp}`)
+
+        // Capture through the expected transition tail before entering the next interval.
+        const transitionBudget = await getTransitionSettleBudget()
+        await captureForDuration(transitionBudget)
       }
-    })()
-      .catch((error) => {
-        playbackError = error
-      })
-      .finally(() => {
-        shouldCapture = false
-      })
-
-    const frameInterval = 1000 / videoFps
-    let nextFrameTime = 0
-
-    let captureError: unknown
-    try {
-      while (true) {
-        if (!shouldCapture)
-          break
-        const frame = await captureFrame()
-        await writeFrame(frame)
-        writtenFrames += 1
-        await catchUpFrames(frame)
-
-        const elapsedMs = Date.now() - startedAt
-        nextFrameTime = (writtenFrames + 1) * frameInterval
-        const sleepMs = nextFrameTime - elapsedMs
-        if (sleepMs > 0)
-          await sleep(sleepMs)
-      }
-
-      await playback
-      if (playbackError)
-        throw playbackError
 
       const lastFrame = await captureFrame()
       await writeFrame(lastFrame)
