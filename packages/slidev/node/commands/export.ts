@@ -44,6 +44,7 @@ export interface ExportOptions {
   videoFps?: number
   videoWidth?: number
   videoHeight?: number
+  videoMotionScale?: number
 }
 
 interface ExportPngResult {
@@ -84,12 +85,12 @@ function sleep(ms: number) {
   return new Promise<void>(resolve => setTimeout(resolve, ms))
 }
 
-function parseVideoMotionScale(value?: string) {
-  if (!value)
+function parseVideoMotionScale(value?: number | string) {
+  if (value === undefined || value === null)
     return 1
-  const scale = Number.parseFloat(value)
+  const scale = typeof value === 'number' ? value : Number.parseFloat(value)
   if (!Number.isFinite(scale) || scale <= 0)
-    return 1
+    throw new Error(`[slidev] Invalid --video-motion-scale "${value}". Expected a number greater than 0.`)
   return scale
 }
 
@@ -234,6 +235,7 @@ export async function exportSlides({
   videoFps = 30,
   videoWidth = 1920,
   videoHeight = 1080,
+  videoMotionScale = 1,
 }: ExportOptions) {
   const pages: number[] = parseRangeString(total, range)
 
@@ -739,7 +741,7 @@ export async function exportSlides({
     const debugMp4 = process.env.SLIDEV_EXPORT_DEBUG_MP4 === 'true'
     // Capture-side motion dilation. >1 means slower visual motion while recording,
     // so high-resolution exports can collect more unique frames per transition.
-    const motionScale = parseVideoMotionScale(process.env.SLIDEV_EXPORT_MOTION_SCALE)
+    const motionScale = parseVideoMotionScale(videoMotionScale)
     // Encoding-side timeline compression to restore the intended playback pace
     // after capture-side motion dilation.
     const playbackSpeedup = motionScale > 1 ? motionScale : 1
@@ -1055,6 +1057,7 @@ export function getExportOptions(args: ExportArgs, options: ResolvedSlidevOption
       videoInterval: args['video-interval'],
       videoFps: args['video-fps'],
       videoSize: args['video-size'],
+      videoMotionScale: args['video-motion-scale'],
     }),
   }
   const {
@@ -1075,6 +1078,7 @@ export function getExportOptions(args: ExportArgs, options: ResolvedSlidevOption
     videoInterval,
     videoFps,
     videoSize,
+    videoMotionScale,
   } = config
   const parsedVideoSize = parseVideoSize(videoSize)
   outFilename = output || outFilename || options.data.config.exportFilename || `${path.basename(entry, '.md')}-export`
@@ -1101,6 +1105,7 @@ export function getExportOptions(args: ExportArgs, options: ResolvedSlidevOption
     videoFps: videoFps ?? 30,
     videoWidth: parsedVideoSize?.width ?? 1920,
     videoHeight: parsedVideoSize?.height ?? 1080,
+    videoMotionScale: videoMotionScale ?? 1,
   }
 }
 

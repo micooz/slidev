@@ -20,6 +20,7 @@ export interface ExportArgs extends CommonArgs {
   'video-interval'?: number
   'video-fps'?: number
   'video-size'?: string
+  'video-motion-scale'?: number
 }
 
 export interface BuildArgs extends ExportArgs {

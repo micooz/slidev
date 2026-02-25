@@ -641,6 +641,10 @@ function exportOptions<T>(args: Argv<T>) {
       type: 'string',
       describe: 'video size used when exporting mp4, for example "1920x1080"',
     })
+    .option('video-motion-scale', {
+      type: 'number',
+      describe: 'capture motion slow-down factor for mp4 export. >1 captures more animation frames and then speeds the timeline back up; increases export cost and may affect timing of time-based media',
+    })
 }
 
 function printInfo(

@@ -87,6 +87,14 @@ Useful options:
 - `--video-interval`: waiting time in milliseconds after each transition/click (default: `2000`)
 - `--video-fps`: target frame rate (default: `30`)
 - `--video-size`: output resolution, for example `1920x1080`
+- `--video-motion-scale`: capture motion slow-down factor (default: `1`)
+
+When `--video-motion-scale` is greater than `1`, Slidev slows transitions/animations during capture and then compresses the timeline back to normal playback speed in ffmpeg. This often improves effective animation smoothness for high-resolution exports.
+
+Side effects:
+
+- export takes longer and uses more CPU
+- timing of time-based media (for example embedded video/iframe content) may differ from live playback
 
 ### PNGs and Markdown
 

@@ -80,6 +80,7 @@ Options:
 - `--video-interval` (`number`, default: `2000`): waiting time in milliseconds after each click/slide transition when exporting mp4.
 - `--video-fps` (`number`, default: `30`): frame rate when exporting mp4.
 - `--video-size` (`string`, default: `'1920x1080'`): output video size for mp4.
+- `--video-motion-scale` (`number`, default: `1`): capture motion slow-down factor for mp4 export. Use values `>1` to capture more effective animation frames and then speed the timeline back up.
 
 ## `slidev format [entry]` {#format}
 
