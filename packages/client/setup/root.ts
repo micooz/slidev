@@ -1,3 +1,4 @@
+import type { SlidevExportBridge } from '@slidev/types'
 import setups from '#slidev/setups/root'
 import { useHead } from '@unhead/vue'
 import { computed, getCurrentInstance, reactive, ref, shallowRef, watch } from 'vue'
@@ -29,10 +30,24 @@ export default function setupRoot() {
 
   // allows controls from postMessages
   if (__DEV__) {
-    // @ts-expect-error expose global
     window.__slidev__ = context
     useEmbeddedControl()
   }
+
+  // Expose a stable bridge for automation exporters in all modes.
+  const exportBridge: SlidevExportBridge = {
+    hasNextStep: () => context.nav.hasNext,
+    nextStep: () => context.nav.next(),
+    goStep: (no: number, clicks: number) => context.nav.go(no, clicks, true),
+    getStepStamp: () => `${context.nav.currentSlideNo}-${context.nav.clicks}`,
+    getStepInfo: () => ({
+      no: Number(context.nav.currentSlideNo),
+      clicks: Number(context.nav.clicks),
+      clicksTotal: Number(context.nav.clicksTotal),
+      hasNext: Boolean(context.nav.hasNext),
+    }),
+  }
+  window.__slidev_export__ = exportBridge
 
   // User Setups
   for (const setup of setups)

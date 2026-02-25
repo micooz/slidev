@@ -1,5 +1,7 @@
-import type { ExportArgs, ResolvedSlidevOptions, SlideInfo, TocItem } from '@slidev/types'
+import type { ExportArgs, ResolvedSlidevOptions, SlideInfo, SlidevExportStepInfo, TocItem } from '@slidev/types'
 import { Buffer } from 'node:buffer'
+import { spawn } from 'node:child_process'
+import { once } from 'node:events'
 import fs from 'node:fs/promises'
 import path, { dirname, relative } from 'node:path'
 import process from 'node:process'
@@ -19,7 +21,7 @@ export interface ExportOptions {
   slides: SlideInfo[]
   port?: number
   base?: string
-  format?: 'pdf' | 'png' | 'pptx' | 'md'
+  format?: 'pdf' | 'png' | 'pptx' | 'md' | 'mp4'
   output?: string
   timeout?: number
   wait?: number
@@ -38,12 +40,48 @@ export interface ExportOptions {
   perSlide?: boolean
   scale?: number
   omitBackground?: boolean
+  videoInterval?: number
+  videoFps?: number
+  videoWidth?: number
+  videoHeight?: number
 }
 
 interface ExportPngResult {
   slideIndex: number
   buffer: Buffer
   filename: string
+}
+
+interface Mp4StepInfo {
+  no: number
+  clicks: number
+  clicksTotal: number
+  hasNext: boolean
+}
+
+function parseVideoSize(value?: string) {
+  if (!value)
+    return undefined
+
+  const matched = value.match(/^(\d+)x(\d+)$/i)
+  if (!matched)
+    throw new Error(`[slidev] Invalid --video-size "${value}". Expected "<width>x<height>", for example "1920x1080"`)
+
+  const width = Number(matched[1])
+  const height = Number(matched[2])
+  if (!Number.isInteger(width) || !Number.isInteger(height) || width <= 0 || height <= 0)
+    throw new Error(`[slidev] Invalid --video-size "${value}". Width and height should be positive integers.`)
+
+  return {
+    width,
+    height,
+  }
+}
+
+function sleep(ms: number) {
+  if (ms <= 0)
+    return Promise.resolve()
+  return new Promise<void>(resolve => setTimeout(resolve, ms))
 }
 
 function addToTree(tree: TocItem[], info: SlideInfo, slideIndexes: Record<number, number>, level = 1) {
@@ -183,6 +221,10 @@ export async function exportSlides({
   scale = 1,
   waitUntil,
   omitBackground = false,
+  videoInterval = 2000,
+  videoFps = 30,
+  videoWidth = 1920,
+  videoHeight = 1080,
 }: ExportOptions) {
   const pages: number[] = parseRangeString(total, range)
 
@@ -190,17 +232,20 @@ export async function exportSlides({
   const browser = await chromium.launch({
     executablePath,
   })
+  const isMp4 = format === 'mp4'
   const context = await browser.newContext({
     viewport: {
-      width,
+      width: isMp4 ? videoWidth : width,
       // Calculate height for every slides to be in the viewport to trigger the rendering of iframes (twitter, youtube...)
-      height: perSlide ? height : height * pages.length,
+      height: isMp4
+        ? videoHeight
+        : (perSlide ? height : height * pages.length),
     },
-    deviceScaleFactor: scale,
+    deviceScaleFactor: isMp4 ? 1 : scale,
   })
   const page = await context.newPage()
-  const progress = createSlidevProgress(!perSlide)
-  progress.start(pages.length)
+  const progress = createSlidevProgress(isMp4 || !perSlide)
+  progress.start(isMp4 ? 1 : pages.length)
 
   if (format === 'pdf') {
     await genPagePdf()
@@ -215,6 +260,9 @@ export async function exportSlides({
     const buffers = await genPagePng(false)
     await genPagePptx(buffers)
   }
+  else if (format === 'mp4') {
+    await genPageMp4()
+  }
   else {
     throw new Error(`[slidev] Unsupported exporting format "${format}"`)
   }
@@ -225,32 +273,7 @@ export async function exportSlides({
   const relativeOutput = slash(relative('.', output))
   return relativeOutput.startsWith('.') ? relativeOutput : `./${relativeOutput}`
 
-  async function go(no: number | string, clicks?: string) {
-    const query = new URLSearchParams()
-    if (withClicks)
-      query.set('print', 'clicks')
-    else
-      query.set('print', 'true')
-    if (range)
-      query.set('range', range)
-    if (clicks)
-      query.set('clicks', clicks)
-
-    const url = routerMode === 'hash'
-      ? `http://localhost:${port}${base}?${query}#${no}`
-      : `http://localhost:${port}${base}${no}?${query}`
-    await page.goto(url, {
-      waitUntil,
-      timeout,
-    })
-    if (waitUntil)
-      await page.waitForLoadState(waitUntil)
-    await page.emulateMedia({ colorScheme: dark ? 'dark' : 'light', media: 'screen' })
-    const slide = no === 'print'
-      ? page.locator('body')
-      : page.locator(`[data-slidev-no="${no}"]`)
-    await slide.waitFor()
-
+  async function waitForSlideStabilized(slide: ReturnType<typeof page.locator>) {
     // Wait for slides to be loaded
     {
       const elements = slide.locator('.slidev-slide-loading')
@@ -301,9 +324,61 @@ export async function exportSlides({
         await element.evaluate(node => node.style.display = 'none')
       }
     }
+  }
+
+  async function go(no: number | string, clicks?: string) {
+    const query = new URLSearchParams()
+    if (withClicks)
+      query.set('print', 'clicks')
+    else
+      query.set('print', 'true')
+    if (range)
+      query.set('range', range)
+    if (clicks)
+      query.set('clicks', clicks)
+
+    const url = routerMode === 'hash'
+      ? `http://localhost:${port}${base}?${query}#${no}`
+      : `http://localhost:${port}${base}${no}?${query}`
+    await page.goto(url, {
+      waitUntil,
+      timeout,
+    })
+    if (waitUntil)
+      await page.waitForLoadState(waitUntil)
+    await page.emulateMedia({ colorScheme: dark ? 'dark' : 'light', media: 'screen' })
+    const slide = no === 'print'
+      ? page.locator('body')
+      : page.locator(`[data-slidev-no="${no}"]`)
+    await slide.waitFor()
+    await waitForSlideStabilized(slide)
+
     // Wait for the given time
     if (wait)
       await page.waitForTimeout(wait)
+  }
+
+  async function goPlay(no: number, clicks = 0) {
+    const query = new URLSearchParams()
+    query.set('embedded', 'true')
+    if (clicks)
+      query.set('clicks', `${clicks}`)
+
+    const url = routerMode === 'hash'
+      ? `http://localhost:${port}${base}?${query}#${no}`
+      : `http://localhost:${port}${base}${no}?${query}`
+    await page.goto(url, {
+      waitUntil,
+      timeout,
+    })
+    if (waitUntil)
+      await page.waitForLoadState(waitUntil)
+
+    await page.emulateMedia({ colorScheme: dark ? 'dark' : 'light', media: 'screen' })
+    const slide = page.locator(`[data-slidev-no="${no}"]`)
+    await slide.waitFor()
+    await waitForSlideStabilized(slide)
+    await waitForStepSettled()
   }
 
   async function getSlidesIndex() {
@@ -535,6 +610,313 @@ export async function exportSlides({
     await fs.writeFile(output, buffer)
   }
 
+  async function waitForStepChanged(previousStamp: string, timeout = 1200) {
+    return await page.waitForFunction((prev) => {
+      const bridge = window.__slidev_export__
+      if (typeof bridge?.getStepStamp === 'function')
+        return bridge.getStepStamp() !== prev
+
+      const nav = window.__slidev__?.nav
+      const currentSlideNo = nav?.currentSlideNo
+      const clicks = nav?.clicks
+      const slideNo = (typeof currentSlideNo === 'object' && currentSlideNo && 'value' in currentSlideNo)
+        ? Number(currentSlideNo.value ?? 0)
+        : Number(currentSlideNo ?? 0)
+      const clickNo = (typeof clicks === 'object' && clicks && 'value' in clicks)
+        ? Number(clicks.value ?? 0)
+        : Number(clicks ?? 0)
+      return `${slideNo}-${clickNo}` !== prev
+    }, previousStamp, { timeout })
+      .then(() => true)
+      .catch(() => false)
+  }
+
+  function getStepKey(step: Pick<Mp4StepInfo, 'no' | 'clicks'>) {
+    return `${step.no}-${step.clicks}`
+  }
+
+  async function getStepInfo() {
+    return await page.evaluate(() => {
+      const bridge = window.__slidev_export__
+      if (typeof bridge?.getStepInfo === 'function')
+        return bridge.getStepInfo()
+
+      const nav = window.__slidev__?.nav
+      const currentSlideNo = nav?.currentSlideNo
+      const clicks = nav?.clicks
+      const clicksTotal = nav?.clicksTotal
+      const hasNext = nav?.hasNext
+      return {
+        no: (typeof currentSlideNo === 'object' && currentSlideNo && 'value' in currentSlideNo)
+          ? Number(currentSlideNo.value ?? 0)
+          : Number(currentSlideNo ?? 0),
+        clicks: (typeof clicks === 'object' && clicks && 'value' in clicks)
+          ? Number(clicks.value ?? 0)
+          : Number(clicks ?? 0),
+        clicksTotal: (typeof clicksTotal === 'object' && clicksTotal && 'value' in clicksTotal)
+          ? Number(clicksTotal.value ?? 0)
+          : Number(clicksTotal ?? 0),
+        hasNext: (typeof hasNext === 'object' && hasNext && 'value' in hasNext)
+          ? Boolean(hasNext.value)
+          : Boolean(hasNext),
+      } satisfies SlidevExportStepInfo
+    })
+  }
+
+  async function nextStep() {
+    return await page.evaluate(async () => {
+      const bridge = window.__slidev_export__
+      if (typeof bridge?.nextStep === 'function') {
+        await bridge.nextStep()
+        return true
+      }
+
+      const nav = window.__slidev__?.nav
+      if (typeof nav?.next === 'function') {
+        await nav.next()
+        return true
+      }
+
+      return false
+    })
+  }
+
+  async function waitForStepSettled(timeout = 10000) {
+    const settleBudget = await page.evaluate(() => {
+      const raw = getComputedStyle(document.documentElement)
+        .getPropertyValue('--slidev-transition-duration')
+        .trim()
+
+      const parseMs = (value: string) => {
+        if (!value)
+          return 0
+        if (value.endsWith('ms'))
+          return Number.parseFloat(value.slice(0, -2)) || 0
+        if (value.endsWith('s'))
+          return (Number.parseFloat(value.slice(0, -1)) || 0) * 1000
+        return Number.parseFloat(value) || 0
+      }
+
+      // Keep this bounded to avoid long waits caused by custom/infinite animations.
+      return Math.max(120, Math.min(3000, parseMs(raw) + 300))
+    })
+
+    await sleep(settleBudget)
+
+    await page.waitForFunction(() => {
+      const root = document.querySelector('#slideshow') as Element | null
+      if (!root)
+        return true
+      return !root.querySelector('[class*="-enter-active"], [class*="-leave-active"]')
+    }, undefined, { timeout: Math.min(timeout, settleBudget + 2000) }).catch(() => {})
+
+    await page.evaluate(async () => {
+      await new Promise(resolve =>
+        requestAnimationFrame(() => requestAnimationFrame(resolve)),
+      )
+    })
+  }
+
+  async function waitForFfmpeg() {
+    const child = spawn('ffmpeg', ['-version'], { stdio: 'ignore' })
+    await new Promise<void>((resolve, reject) => {
+      child.once('error', reject)
+      child.once('close', (code) => {
+        if (code === 0)
+          resolve()
+        else
+          reject(new Error('ffmpeg exited with non-zero code'))
+      })
+    }).catch(() => {
+      throw new Error('[slidev] MP4 export requires ffmpeg. Please install ffmpeg and try again.')
+    })
+  }
+
+  async function genPageMp4() {
+    if (withClicks === false)
+      throw new Error('[slidev] MP4 export always includes clicks. Remove --with-clicks=false to continue.')
+
+    if (!Number.isInteger(videoFps) || videoFps < 1 || videoFps > 60)
+      throw new Error(`[slidev] Invalid video fps "${videoFps}". Expected an integer between 1 and 60.`)
+    if (!Number.isInteger(videoInterval) || videoInterval < 0)
+      throw new Error(`[slidev] Invalid video interval "${videoInterval}". Expected a non-negative integer.`)
+
+    if (!output.endsWith('.mp4'))
+      output = `${output}.mp4`
+
+    const debugMp4 = process.env.SLIDEV_EXPORT_DEBUG_MP4 === 'true'
+
+    const startSlideNo = pages[0] ?? 1
+    const endSlideNo = pages[pages.length - 1] ?? startSlideNo
+    const isContiguousRange = pages.every((value, index) => index === 0 || value === pages[index - 1] + 1)
+    if (!isContiguousRange)
+      throw new Error('[slidev] MP4 export currently requires a contiguous --range (for example: "1-5").')
+
+    await waitForFfmpeg()
+    await goPlay(startSlideNo, 0)
+
+    const ffmpeg = spawn('ffmpeg', [
+      '-y',
+      '-f',
+      'image2pipe',
+      '-framerate',
+      `${videoFps}`,
+      '-vcodec',
+      'png',
+      '-i',
+      '-',
+      '-an',
+      '-c:v',
+      'libx264',
+      '-pix_fmt',
+      'yuv420p',
+      '-movflags',
+      '+faststart',
+      output,
+    ], {
+      stdio: ['pipe', 'ignore', 'pipe'],
+    })
+
+    let ffmpegLogs = ''
+    ffmpeg.stderr?.on('data', (chunk) => {
+      ffmpegLogs += chunk.toString()
+    })
+
+    const ffmpegDone = new Promise<void>((resolve, reject) => {
+      ffmpeg.once('error', reject)
+      ffmpeg.once('close', (code) => {
+        if (code === 0)
+          resolve()
+        else
+          reject(new Error(ffmpegLogs.trim() || `[slidev] ffmpeg exited with code ${code}`))
+      })
+    })
+
+    const target = page.locator('#slide-content')
+    await target.waitFor()
+
+    async function writeFrame(buffer: Buffer) {
+      if (!ffmpeg.stdin.write(buffer))
+        await once(ffmpeg.stdin, 'drain')
+    }
+
+    // Clip to the transformed slide content bounds to avoid 1px side seams
+    // caused by sub-pixel edges when capturing the outer container.
+    const clip = await page.evaluate(() => {
+      const element = document.querySelector('#slide-content')
+      if (!element)
+        return null
+      const rect = element.getBoundingClientRect()
+      const left = Math.ceil(rect.left)
+      const top = Math.ceil(rect.top)
+      const right = Math.floor(rect.right)
+      const bottom = Math.floor(rect.bottom)
+      const width = right - left
+      const height = bottom - top
+      if (width <= 0 || height <= 0)
+        return null
+      return { x: left, y: top, width, height }
+    })
+
+    async function captureFrame() {
+      if (clip) {
+        return await page.screenshot({
+          type: 'png',
+          clip,
+        })
+      }
+      return await target.screenshot({ type: 'png' })
+    }
+
+    const startedAt = Date.now()
+    let writtenFrames = 0
+
+    async function catchUpFrames(buffer: Buffer) {
+      const now = Date.now()
+      const elapsedMs = now - startedAt
+      const expectedFrames = Math.max(1, Math.floor(elapsedMs * videoFps / 1000))
+      while (writtenFrames < expectedFrames) {
+        await writeFrame(buffer)
+        writtenFrames += 1
+      }
+    }
+
+    let shouldCapture = true
+    let playbackError: unknown
+
+    const playback = (async () => {
+      while (true) {
+        await waitForStepSettled()
+        await sleep(videoInterval)
+
+        const step = await getStepInfo()
+        if (debugMp4)
+          process.stderr.write(`[slidev] mp4 step ${step.no}-${step.clicks}/${step.clicksTotal} hasNext=${step.hasNext}\n`)
+        const canAdvanceInRange = step.no < endSlideNo
+          || (step.no === endSlideNo && step.clicks < step.clicksTotal)
+
+        if (!step.hasNext || !canAdvanceInRange)
+          break
+
+        const previousStamp = getStepKey(step)
+        const advanced = await nextStep()
+        if (!advanced)
+          throw new Error('[slidev] Failed to trigger next step in browser context.')
+
+        const changed = await waitForStepChanged(previousStamp, Math.min(10000, timeout))
+        if (!changed)
+          throw new Error(`[slidev] Failed to advance from step ${previousStamp}`)
+      }
+    })()
+      .catch((error) => {
+        playbackError = error
+      })
+      .finally(() => {
+        shouldCapture = false
+      })
+
+    const frameInterval = 1000 / videoFps
+    let nextFrameTime = 0
+
+    let captureError: unknown
+    try {
+      while (true) {
+        if (!shouldCapture)
+          break
+        const frame = await captureFrame()
+        await writeFrame(frame)
+        writtenFrames += 1
+        await catchUpFrames(frame)
+
+        const elapsedMs = Date.now() - startedAt
+        nextFrameTime = (writtenFrames + 1) * frameInterval
+        const sleepMs = nextFrameTime - elapsedMs
+        if (sleepMs > 0)
+          await sleep(sleepMs)
+      }
+
+      await playback
+      if (playbackError)
+        throw playbackError
+
+      const lastFrame = await captureFrame()
+      await writeFrame(lastFrame)
+      writtenFrames += 1
+      await catchUpFrames(lastFrame)
+      ffmpeg.stdin.end()
+      await ffmpegDone
+    }
+    catch (error) {
+      captureError = error
+    }
+
+    if (captureError) {
+      ffmpeg.stdin.end()
+      await ffmpegDone.catch(() => {})
+      throw captureError
+    }
+  }
+
   // Adds metadata (title, author, keywords) to PDF document, mutating it
   function addPdfMetadata(pdf: PDFDocument): void {
     const titleSlide = slides[0]
@@ -579,6 +961,9 @@ export function getExportOptions(args: ExportArgs, options: ResolvedSlidevOption
       withToc: args['with-toc'],
       perSlide: args['per-slide'],
       omitBackground: args['omit-background'],
+      videoInterval: args['video-interval'],
+      videoFps: args['video-fps'],
+      videoSize: args['video-size'],
     }),
   }
   const {
@@ -596,14 +981,18 @@ export function getExportOptions(args: ExportArgs, options: ResolvedSlidevOption
     perSlide,
     scale,
     omitBackground,
+    videoInterval,
+    videoFps,
+    videoSize,
   } = config
+  const parsedVideoSize = parseVideoSize(videoSize)
   outFilename = output || outFilename || options.data.config.exportFilename || `${path.basename(entry, '.md')}-export`
   return {
     output: outFilename,
     slides: options.data.slides,
     total: options.data.slides.length,
     range,
-    format: (format || 'pdf') as 'pdf' | 'png' | 'pptx' | 'md',
+    format: (format || 'pdf') as 'pdf' | 'png' | 'pptx' | 'md' | 'mp4',
     timeout: timeout ?? 30000,
     wait: wait ?? 0,
     waitUntil: waitUntil === 'none' ? undefined : (waitUntil ?? 'networkidle') as 'networkidle' | 'load' | 'domcontentloaded',
@@ -611,12 +1000,16 @@ export function getExportOptions(args: ExportArgs, options: ResolvedSlidevOption
     routerMode: options.data.config.routerMode,
     width: options.data.config.canvasWidth,
     height: Math.round(options.data.config.canvasWidth / options.data.config.aspectRatio),
-    withClicks: withClicks ?? format === 'pptx',
+    withClicks: withClicks ?? ['pptx', 'mp4'].includes(String(format)),
     executablePath,
     withToc: withToc || false,
     perSlide: perSlide || false,
     scale: scale || 2,
     omitBackground: omitBackground ?? false,
+    videoInterval: videoInterval ?? 2000,
+    videoFps: videoFps ?? 30,
+    videoWidth: parsedVideoSize?.width ?? 1920,
+    videoHeight: parsedVideoSize?.height ?? 1080,
   }
 }
 

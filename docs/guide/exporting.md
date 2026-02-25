@@ -4,7 +4,7 @@ outline: deep
 
 # Exporting
 
-Usually the slides are displayed in a web browser, but you can also export them to PDF, PPTX, PNG, or Markdown files for sharing or printing. This feature is available through the CLI command [`slidev export`](../builtin/cli#export).
+Usually the slides are displayed in a web browser, but you can also export them to PDF, PPTX, PNG, MP4, or Markdown files for sharing or printing. This feature is available through the CLI command [`slidev export`](../builtin/cli#export).
 
 However, interactive features in your slides may not be available in the exported files. You can build and host your slides as a web application to keep the interactivity. See [Building and Hosting](./hosting) for more information.
 
@@ -22,7 +22,7 @@ Note that browsers other than **modern Chromium-based browsers** may not work we
 
 ## The CLI {#cli}
 
-Exporting to PDF, PPTX, or PNG relies on [Playwright](https://playwright.dev) for rendering the slides. Therefore [`playwright-chromium`](https://npmjs.com/package/playwright-chromium) is required to be installed in your project:
+Exporting to PDF, PPTX, PNG, or MP4 relies on [Playwright](https://playwright.dev) for rendering the slides. Therefore [`playwright-chromium`](https://npmjs.com/package/playwright-chromium) is required to be installed in your project:
 
 ::: code-group
 
@@ -71,6 +71,22 @@ $ slidev export --format pptx
 Note that all the slides in the PPTX file will be exported as images, so the text will not be selectable. Presenter notes will be conveyed into the PPTX file on a per-slide basis.
 
 In this mode, the `--with-clicks` option is enabled by default. To disable it, pass `--with-clicks false`.
+
+### MP4
+
+Slidev can export your slides as an MP4 video with transitions and click steps:
+
+```bash
+$ slidev export --format mp4
+```
+
+MP4 export requires `ffmpeg` available in your environment.
+
+Useful options:
+
+- `--video-interval`: waiting time in milliseconds after each transition/click (default: `2000`)
+- `--video-fps`: target frame rate (default: `30`)
+- `--video-size`: output resolution, for example `1920x1080`
 
 ### PNGs and Markdown
 

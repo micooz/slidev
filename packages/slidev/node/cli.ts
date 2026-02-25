@@ -580,7 +580,7 @@ function exportOptions<T>(args: Argv<T>) {
     })
     .option('format', {
       type: 'string',
-      choices: ['pdf', 'png', 'pptx', 'md'],
+      choices: ['pdf', 'png', 'pptx', 'md', 'mp4'],
       describe: 'output format',
     })
     .option('timeout', {
@@ -628,6 +628,18 @@ function exportOptions<T>(args: Argv<T>) {
     .option('omit-background', {
       type: 'boolean',
       describe: 'export png pages without the default browser background',
+    })
+    .option('video-interval', {
+      type: 'number',
+      describe: 'wait for the specified ms after each click/slide transition when exporting mp4',
+    })
+    .option('video-fps', {
+      type: 'number',
+      describe: 'frame rate used when exporting mp4',
+    })
+    .option('video-size', {
+      type: 'string',
+      describe: 'video size used when exporting mp4, for example "1920x1080"',
     })
 }
 

@@ -4,7 +4,7 @@ import { sleep } from '@antfu/utils'
 import { parseRangeString } from '@slidev/parser/utils'
 import { useHead } from '@unhead/vue'
 import { provideLocal, useElementSize, useStyleTag, watchDebounced } from '@vueuse/core'
-import { computed, ref, useTemplateRef, watch } from 'vue'
+import { computed, onMounted, ref, useTemplateRef, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { useDarkMode } from '../composables/useDarkMode'
 import { useNav } from '../composables/useNav'
@@ -33,6 +33,121 @@ type ScreenshotResult = { slideIndex: number, clickIndex: number, dataUrl: strin
 const screenshotSession = ref<ScreenshotSession | null>(null)
 const capturedImages = ref<ScreenshotResult | null>(null)
 const title = ref(configs.exportFilename || slidesTitle)
+const videoInterval = ref(2000)
+const videoFps = ref(30)
+const videoSize = ref('1920x1080')
+const videoFpsOptions = [24, 30, 60]
+const videoSizeOptions = [
+  '1280x720',
+  '1920x1080',
+  '2560x1440',
+  '3840x2160',
+]
+const videoSizeSelection = ref(videoSize.value)
+const videoSizeCustom = ref('')
+const videoExporting = ref(false)
+const videoExportError = ref('')
+const videoExportStatus = ref('')
+const videoExportElapsedMs = ref(0)
+const videoExportJobId = ref('')
+const videoDownloadReady = ref(false)
+const videoDownloadFilename = ref('')
+const videoDownloadUrl = computed(() => videoExportJobId.value
+  ? `/__slidev/export/video/${videoExportJobId.value}/download`
+  : '')
+const VIDEO_EXPORT_JOB_STORAGE_KEY = 'slidev.export.video.jobId'
+
+function formatDuration(ms: number) {
+  return `${(Math.max(0, ms) / 1000).toFixed(1)}s`
+}
+
+function updateStoredVideoJobId(jobId?: string) {
+  videoExportJobId.value = jobId || ''
+  if (videoExportJobId.value)
+    localStorage.setItem(VIDEO_EXPORT_JOB_STORAGE_KEY, videoExportJobId.value)
+  else
+    localStorage.removeItem(VIDEO_EXPORT_JOB_STORAGE_KEY)
+}
+
+function triggerDownload(url: string) {
+  const a = document.createElement('a')
+  a.href = url
+  a.click()
+}
+
+interface VideoExportStatusResponse {
+  status?: 'running' | 'done' | 'error'
+  error?: string
+  durationMs?: number
+  filename?: string
+  downloadUrl?: string
+}
+
+async function queryVideoJobStatus(jobId: string) {
+  const statusResponse = await fetch(`/__slidev/export/video/${jobId}`)
+  if (statusResponse.status === 404) {
+    updateStoredVideoJobId()
+    videoDownloadReady.value = false
+    throw new Error('Export job not found or expired. Please export again.')
+  }
+  if (!statusResponse.ok)
+    throw new Error(`Failed to query mp4 export status (${statusResponse.status})`)
+
+  const statusData = await statusResponse.json() as VideoExportStatusResponse
+  if (Number.isFinite(statusData.durationMs))
+    videoExportElapsedMs.value = Number(statusData.durationMs)
+
+  if (statusData.status === 'running')
+    videoExportStatus.value = 'exporting'
+  else if (statusData.status === 'done')
+    videoExportStatus.value = 'done'
+  else if (statusData.status === 'error')
+    videoExportStatus.value = 'error'
+  else
+    videoExportStatus.value = statusData.status || ''
+
+  if (statusData.filename)
+    videoDownloadFilename.value = statusData.filename
+
+  return statusData
+}
+
+async function pollVideoJob(jobId: string, autoDownload = false) {
+  while (true) {
+    const statusData = await queryVideoJobStatus(jobId)
+    if (statusData.status === 'done') {
+      videoDownloadReady.value = true
+      videoExporting.value = false
+      if (autoDownload)
+        triggerDownload(statusData.downloadUrl || `/__slidev/export/video/${jobId}/download`)
+      break
+    }
+    if (statusData.status === 'error') {
+      videoExporting.value = false
+      throw new Error(statusData.error || 'MP4 export failed')
+    }
+    await sleep(1000)
+  }
+}
+
+watch(videoSizeSelection, (value) => {
+  if (value === 'custom') {
+    if (!videoSizeCustom.value)
+      videoSizeCustom.value = videoSize.value
+    return
+  }
+  videoSize.value = value
+})
+
+watch(videoSizeCustom, (value) => {
+  if (videoSizeSelection.value === 'custom')
+    videoSize.value = value.trim()
+})
+
+if (!videoSizeOptions.includes(videoSize.value)) {
+  videoSizeSelection.value = 'custom'
+  videoSizeCustom.value = videoSize.value
+}
 
 useHead({
   title,
@@ -167,6 +282,76 @@ async function pngsGz() {
   a.click()
 }
 
+async function mp4() {
+  if (videoExporting.value)
+    return
+
+  videoExporting.value = true
+  videoExportError.value = ''
+  videoExportStatus.value = 'starting'
+  videoExportElapsedMs.value = 0
+  videoDownloadReady.value = false
+  videoDownloadFilename.value = ''
+  updateStoredVideoJobId()
+
+  try {
+    const response = await fetch('/__slidev/export/video', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        videoInterval: videoInterval.value,
+        videoFps: videoFps.value,
+        videoSize: videoSize.value,
+        range: rangesRaw.value.trim() || undefined,
+        dark: isDark.value,
+      }),
+    })
+
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}))
+      throw new Error(data.error || `Failed to start mp4 export (${response.status})`)
+    }
+
+    const { jobId } = await response.json() as { jobId: string }
+    updateStoredVideoJobId(jobId)
+    await pollVideoJob(jobId, true)
+  }
+  catch (error) {
+    console.error(error)
+    videoExportError.value = error instanceof Error ? error.message : String(error)
+    videoExporting.value = false
+  }
+}
+
+onMounted(async () => {
+  const savedJobId = localStorage.getItem(VIDEO_EXPORT_JOB_STORAGE_KEY)
+  if (!savedJobId)
+    return
+
+  updateStoredVideoJobId(savedJobId)
+  videoExportError.value = ''
+  try {
+    const statusData = await queryVideoJobStatus(savedJobId)
+    if (statusData.status === 'running') {
+      videoExporting.value = true
+      await pollVideoJob(savedJobId, false)
+    }
+    else if (statusData.status === 'done') {
+      videoDownloadReady.value = true
+      videoExporting.value = false
+    }
+    else if (statusData.status === 'error') {
+      videoExporting.value = false
+      videoExportError.value = statusData.error || 'MP4 export failed'
+    }
+  }
+  catch (error) {
+    videoExportError.value = error instanceof Error ? error.message : String(error)
+  }
+})
+
 useStyleTag(computed(() => screenshotSession.value?.isActive
   ? `
 html {
@@ -248,6 +433,63 @@ if (import.meta.hot) {
             <button class="slidev-form-button" @click="pdf">
               PDF
             </button>
+          </div>
+        </div>
+
+        <div border="~ main rounded-lg" p3 flex="~ col gap-2">
+          <h2>Export as Video</h2>
+          <div class="flex flex-col gap-2 min-w-max">
+            <FormItem title="Interval" class="w-full" help="Wait time (ms) after each click/slide transition animation has finished.">
+              <input v-model.number="videoInterval" type="number" step="100" min="0">
+            </FormItem>
+            <FormItem title="FPS" class="w-full">
+              <select v-model.number="videoFps">
+                <option v-for="fps in videoFpsOptions" :key="fps" :value="fps">
+                  {{ fps }}
+                </option>
+              </select>
+            </FormItem>
+            <FormItem title="Resolution" class="w-full !items-start">
+              <div class="flex flex-col gap-2 w-full">
+                <select v-model="videoSizeSelection">
+                  <option v-for="size in videoSizeOptions" :key="size" :value="size">
+                    {{ size }}
+                  </option>
+                  <option value="custom">
+                    Custom
+                  </option>
+                </select>
+                <input
+                  v-if="videoSizeSelection === 'custom'"
+                  v-model="videoSizeCustom"
+                  type="text"
+                  placeholder="e.g. 3440x1440"
+                >
+              </div>
+            </FormItem>
+            <button class="slidev-form-button" :disabled="videoExporting" @click="mp4">
+              {{ videoExporting ? 'Exporting MP4...' : 'MP4' }}
+            </button>
+            <div v-if="videoExportStatus" class="text-sm op70">
+              Status: {{ videoExportStatus }}
+            </div>
+            <div v-if="videoExportStatus" class="text-xs op60">
+              Elapsed: {{ formatDuration(videoExportElapsedMs) }}
+            </div>
+            <div v-if="videoExportError" class="text-sm text-red-500">
+              {{ videoExportError }}
+            </div>
+            <button
+              v-if="videoDownloadReady && videoDownloadUrl"
+              class="slidev-form-button flex items-center justify-center gap-2"
+              @click="triggerDownload(videoDownloadUrl)"
+            >
+              <span class="i-carbon:download inline-block text-lg" />
+              Download MP4
+            </button>
+            <div v-if="videoDownloadReady && videoDownloadFilename" class="text-xs op60 break-all">
+              File: {{ videoDownloadFilename }}
+            </div>
           </div>
         </div>
 
@@ -339,8 +581,9 @@ label {
   }
 
   input[type='text'],
-  input[type='number'] {
-    --uno: border border-main rounded px-2 py-1;
+  input[type='number'],
+  select {
+    --uno: border border-main rounded px-2 py-1 w-full;
   }
 }
 

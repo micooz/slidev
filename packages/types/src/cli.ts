@@ -17,6 +17,9 @@ export interface ExportArgs extends CommonArgs {
   'per-slide'?: boolean
   'scale'?: number
   'omit-background'?: boolean
+  'video-interval'?: number
+  'video-fps'?: number
+  'video-size'?: string
 }
 
 export interface BuildArgs extends ExportArgs {

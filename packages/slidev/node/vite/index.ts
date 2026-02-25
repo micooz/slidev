@@ -4,6 +4,7 @@ import setupVitePlugins from '../setups/vite-plugins'
 import { createVueCompilerFlagsPlugin } from './compilerFlagsVue'
 import { createComponentsPlugin } from './components'
 import { createContextInjectionPlugin } from './contextInjection'
+import { createExportApiPlugin } from './exportApi'
 import { createConfigPlugin } from './extendConfig'
 import { createHmrPatchPlugin } from './hmrPatch'
 import { createIconsPlugin } from './icons'
@@ -27,6 +28,7 @@ export function ViteSlidevPlugin(
 ): Promise<PluginOption[]> {
   return Promise.all([
     createSlidesLoader(options, serverOptions),
+    createExportApiPlugin(options),
     createMarkdownPlugin(options, pluginOptions),
     createLayoutWrapperPlugin(options),
     createContextInjectionPlugin(),
